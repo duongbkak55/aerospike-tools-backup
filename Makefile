@@ -317,12 +317,16 @@ src_to_lib =
 
 BACKUP_SRC_MAIN := $(DIR_SRC)/backup_main.c
 RESTORE_SRC_MAIN := $(DIR_SRC)/restore_main.c
+FILTER_SRC_MAIN := $(DIR_SRC)/filter_main.c
+FILTER_SRC_IMPL := $(DIR_SRC)/filter.c
 FLAGS_SRC_MAIN := $(DIR_SRC)/flags.c
 TOML_SRC_MAIN := $(DIR_SRC)/toml/toml.c
 HELPER_SRCS := $(filter-out $(BACKUP_SRC_MAIN) $(RESTORE_SRC_MAIN) \
+	$(FILTER_SRC_MAIN) $(FILTER_SRC_IMPL) \
 	$(FLAGS_SRC_MAIN) $(TOML_SRC_MAIN),\
 	$(shell find $(DIR_SRC) -name '*.c' -type f))
 HELPER_CXX_SRCS := $(filter-out $(BACKUP_SRC_MAIN) $(RESTORE_SRC_MAIN) \
+	$(FILTER_SRC_MAIN) $(FILTER_SRC_IMPL) \
 	$(FLAGS_SRC_MAIN) $(TOML_SRC_MAIN),\
 	$(shell find $(DIR_SRC) -name '*.cc' -type f))
 
@@ -334,17 +338,22 @@ RESTORE_SRC := $(RESTORE_SRC_MAIN) $(HELPER_SRCS) $(HELPER_CXX_SRCS)
 RESTORE_OBJ := $(call src_to_obj, $(RESTORE_SRC))
 RESTORE_DEP := $(call obj_to_dep, $(RESTORE_OBJ))
 
+FILTER_SRC := $(FILTER_SRC_MAIN) $(FILTER_SRC_IMPL) $(HELPER_SRCS) $(HELPER_CXX_SRCS)
+FILTER_OBJ := $(call src_to_obj, $(FILTER_SRC))
+FILTER_DEP := $(call obj_to_dep, $(FILTER_OBJ))
+
 BACKUP := $(DIR_BIN)/asbackup
 RESTORE := $(DIR_BIN)/asrestore
+FILTER := $(DIR_BIN)/asfilter
 TOML := $(DIR_TOML)/libtoml.a
 
 BACKUP_DYNAMIC := $(DIR_BIN)/asbackup.$(DYNAMIC_SUFFIX)
 RESTORE_DYNAMIC := $(DIR_BIN)/asrestore.$(DYNAMIC_SUFFIX)
 
-SRCS := $(BACKUP_SRC) $(RESTORE_SRC)
-OBJS := $(BACKUP_OBJ) $(RESTORE_OBJ)
-DEPS := $(BACKUP_DEP) $(RESTORE_DEP)
-BINS := $(TOML) $(BACKUP) $(RESTORE)
+SRCS := $(BACKUP_SRC) $(RESTORE_SRC) $(FILTER_SRC)
+OBJS := $(BACKUP_OBJ) $(RESTORE_OBJ) $(FILTER_OBJ)
+DEPS := $(BACKUP_DEP) $(RESTORE_DEP) $(FILTER_DEP)
+BINS := $(TOML) $(BACKUP) $(RESTORE) $(FILTER)
 
 # sort removes duplicates
 SRCS := $(sort $(SRCS))
@@ -472,6 +481,9 @@ $(BACKUP): $(BACKUP_OBJ) $(TOML) $(C_CLIENT_LIB) $(SECRET_CLIENT_LIB) | $(DIR_BI
 $(RESTORE): $(RESTORE_OBJ) $(TOML) $(C_CLIENT_LIB) $(SECRET_CLIENT_LIB) | $(DIR_BIN)
 	$(CXX) $(LDFLAGS) -o $(RESTORE) $(RESTORE_OBJ) $(LIBRARIES)
 
+$(FILTER): $(FILTER_OBJ) $(TOML) $(C_CLIENT_LIB) $(SECRET_CLIENT_LIB) | $(DIR_BIN)
+	$(CXX) $(LDFLAGS) -o $(FILTER) $(FILTER_OBJ) $(LIBRARIES)
+
 $(BACKUP_DYNAMIC): $(BACKUP_OBJ) $(TOML) $(C_CLIENT_LIB) $(SECRET_CLIENT_LIB) | $(DIR_BIN)
 	$(CXX) $(DYNAMIC_FLAG) $(LDFLAGS) -o $(BACKUP_DYNAMIC) $(BACKUP_OBJ) $(LIBRARIES)
 
@@ -489,6 +501,7 @@ $(SECRET_CLIENT_LIB):
 
 -include $(BACKUP_DEP)
 -include $(RESTORE_DEP)
+-include $(FILTER_DEP)
 
 .PHONY: test
 test: unit integration
