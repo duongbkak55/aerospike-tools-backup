@@ -68,8 +68,12 @@
 #define ASB_SUFFIX_LEN 4
 
 // Long-only option IDs (beyond ASCII range).
-#define OPT_KEY_TYPE  1001
-#define OPT_VERSION   1002
+#define OPT_KEY_TYPE      1001
+#define OPT_VERSION       1002
+#define OPT_SPLIT_RECORDS 1003
+#define OPT_SPLIT_SIZE    1004
+
+#define MB (1024ULL * 1024ULL)
 
 typedef enum {
 	FILTER_KEY_TYPE_STRING = 0,
@@ -107,6 +111,19 @@ static bool process_file(const char *in_path, const char *out_path,
 static bool process_directory(const char *in_dir, const char *out_dir,
 		const char *ns_filter, const as_vector *set_list,
 		const filter_keys_t *keys, uint64_t *out_total, uint64_t *out_written);
+static bool split_file(const char *in_path, const char *out_dir,
+		uint64_t split_records, uint64_t split_size_bytes,
+		const char *ns_filter, const as_vector *set_list,
+		const filter_keys_t *keys, uint64_t *out_total, uint64_t *out_written);
+static bool split_directory(const char *in_dir, const char *out_dir,
+		uint64_t split_records, uint64_t split_size_bytes,
+		const char *ns_filter, const as_vector *set_list,
+		const filter_keys_t *keys, uint64_t *out_total, uint64_t *out_written);
+static bool open_split_output(io_write_proxy_t *fd,
+		const char *out_dir, const char *base_name,
+		uint64_t file_index, const char *ns,
+		bool first_file,
+		const as_vector *g_indexes, const as_vector *g_udfs);
 static int compare_str_ptr(const void *a, const void *b);
 static bool ensure_directory(const char *path);
 
@@ -133,20 +150,24 @@ filter_main(int32_t argc, char **argv)
 	char *set_list_str = NULL;
 	char *key_file    = NULL;
 	filter_key_type_t key_type = FILTER_KEY_TYPE_STRING;
+	uint64_t split_records   = 0;   // 0 = no split
+	uint64_t split_size_mb   = 0;   // 0 = no split
 	bool verbose = false;
 
 	static struct option long_opts[] = {
-		{ "input",      required_argument, NULL, 'i' },
-		{ "directory",  required_argument, NULL, 'd' },
-		{ "output",     required_argument, NULL, 'o' },
-		{ "output-dir", required_argument, NULL, 'O' },
-		{ "namespace",  required_argument, NULL, 'n' },
-		{ "set",        required_argument, NULL, 's' },
-		{ "key-file",   required_argument, NULL, 'K' },
-		{ "key-type",   required_argument, NULL, OPT_KEY_TYPE },
-		{ "verbose",    no_argument,       NULL, 'v' },
-		{ "version",    no_argument,       NULL, OPT_VERSION },
-		{ "help",       no_argument,       NULL, 'h' },
+		{ "input",         required_argument, NULL, 'i' },
+		{ "directory",     required_argument, NULL, 'd' },
+		{ "output",        required_argument, NULL, 'o' },
+		{ "output-dir",    required_argument, NULL, 'O' },
+		{ "namespace",     required_argument, NULL, 'n' },
+		{ "set",           required_argument, NULL, 's' },
+		{ "key-file",      required_argument, NULL, 'K' },
+		{ "key-type",      required_argument, NULL, OPT_KEY_TYPE },
+		{ "split-records", required_argument, NULL, OPT_SPLIT_RECORDS },
+		{ "split-size",    required_argument, NULL, OPT_SPLIT_SIZE },
+		{ "verbose",       no_argument,       NULL, 'v' },
+		{ "version",       no_argument,       NULL, OPT_VERSION },
+		{ "help",          no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -194,6 +215,24 @@ filter_main(int32_t argc, char **argv)
 			verbose = true;
 			atomic_store(&g_verbose, true);
 			break;
+		case OPT_SPLIT_RECORDS: {
+			int64_t v;
+			if (!better_atoi(optarg, &v) || v <= 0) {
+				err("--split-records requires a positive integer, got '%s'", optarg);
+				goto cleanup;
+			}
+			split_records = (uint64_t)v;
+			break;
+		}
+		case OPT_SPLIT_SIZE: {
+			int64_t v;
+			if (!better_atoi(optarg, &v) || v <= 0) {
+				err("--split-size requires a positive integer (MB), got '%s'", optarg);
+				goto cleanup;
+			}
+			split_size_mb = (uint64_t)v;
+			break;
+		}
 		case OPT_VERSION:
 			fprintf(stdout, "asfilter %s\n", TOOL_VERSION);
 			res = EXIT_SUCCESS;
@@ -212,8 +251,10 @@ filter_main(int32_t argc, char **argv)
 
 	// ---- validate options ----
 
-	bool have_input_file = (input_file != NULL);
-	bool have_input_dir  = (input_dir  != NULL);
+	bool split_mode = (split_records > 0 || split_size_mb > 0);
+
+	bool have_input_file  = (input_file  != NULL);
+	bool have_input_dir   = (input_dir   != NULL);
 	bool have_output_file = (output_file != NULL);
 	bool have_output_dir  = (output_dir  != NULL);
 
@@ -239,18 +280,31 @@ filter_main(int32_t argc, char **argv)
 		goto cleanup;
 	}
 
-	if (have_input_file && have_output_dir) {
-		err("When input is a file (-i), output must also be a file (-o), not a directory (-O)");
+	// Split mode always writes to a directory (multiple files).
+	if (split_mode && have_output_file) {
+		err("--split-records / --split-size produce multiple files; "
+				"use -O DIRECTORY for output, not -o FILE");
 		goto cleanup;
 	}
 
-	if (have_input_dir && have_output_file) {
-		err("When input is a directory (-d), output must also be a directory (-O), not a file (-o)");
-		goto cleanup;
+	// Without split mode, input/output modes must match.
+	if (!split_mode) {
+		if (have_input_file && have_output_dir) {
+			err("When input is a file (-i), output must also be a file (-o), "
+					"not a directory (-O)");
+			goto cleanup;
+		}
+
+		if (have_input_dir && have_output_file) {
+			err("When input is a directory (-d), output must also be a "
+					"directory (-O), not a file (-o)");
+			goto cleanup;
+		}
 	}
 
-	if (ns_filter == NULL && set_list_str == NULL && key_file == NULL) {
-		err("No filter specified. Use -n, -s, and/or -K to filter records");
+	if (!split_mode && ns_filter == NULL && set_list_str == NULL && key_file == NULL) {
+		err("No filter or split specified. "
+				"Use -n/-s/-K to filter, or --split-records/--split-size to split");
 		print_usage(argv[0]);
 		goto cleanup;
 	}
@@ -306,19 +360,33 @@ filter_main(int32_t argc, char **argv)
 		}
 	}
 
-	// ---- run filter ----
-	uint64_t total_records = 0;
+	// ---- run ----
+	uint64_t total_records   = 0;
 	uint64_t written_records = 0;
+	const filter_keys_t *kp  = (key_file != NULL) ? &keys : NULL;
+	uint64_t split_bytes     = split_size_mb * MB;
 
-	if (have_input_file) {
-		if (!process_file(input_file, output_file, ns_filter, &set_list,
-					key_file != NULL ? &keys : NULL,
+	if (split_mode) {
+		if (have_input_file) {
+			if (!split_file(input_file, output_dir, split_records, split_bytes,
+						ns_filter, &set_list, kp,
+						&total_records, &written_records)) {
+				goto cleanup_keys;
+			}
+		} else {
+			if (!split_directory(input_dir, output_dir, split_records, split_bytes,
+						ns_filter, &set_list, kp,
+						&total_records, &written_records)) {
+				goto cleanup_keys;
+			}
+		}
+	} else if (have_input_file) {
+		if (!process_file(input_file, output_file, ns_filter, &set_list, kp,
 					&total_records, &written_records)) {
 			goto cleanup_keys;
 		}
 	} else {
-		if (!process_directory(input_dir, output_dir, ns_filter, &set_list,
-					key_file != NULL ? &keys : NULL,
+		if (!process_directory(input_dir, output_dir, ns_filter, &set_list, kp,
 					&total_records, &written_records)) {
 			goto cleanup_keys;
 		}
@@ -354,52 +422,63 @@ print_usage(const char *prog)
 	fprintf(stdout,
 		"Usage: %s [options]\n"
 		"\n"
-		"Filters an Aerospike backup file or directory by namespace, set, or key.\n"
+		"Filters and/or splits Aerospike backup files.\n"
 		"Output is in standard asbackup format, compatible with asrestore.\n"
 		"\n"
 		"Input/Output Options:\n"
-		"  -i, --input FILE          Input backup file (.asb)\n"
-		"  -d, --directory DIR       Input backup directory\n"
-		"  -o, --output FILE         Output backup file\n"
-		"  -O, --output-dir DIR      Output backup directory\n"
+		"  -i, --input FILE             Input backup file (.asb)\n"
+		"  -d, --directory DIR          Input backup directory\n"
+		"  -o, --output FILE            Output backup file (filter mode only)\n"
+		"  -O, --output-dir DIR         Output backup directory\n"
 		"\n"
-		"Filter Options (at least one required):\n"
-		"  -n, --namespace NS        Keep only records in namespace NS\n"
-		"  -s, --set SETS            Keep only records in set(s), comma-separated\n"
-		"  -K, --key-file FILE       Keep only records whose user key appears in FILE\n"
-		"      --key-type TYPE       Type of keys in --key-file:\n"
-		"                              string  (default) - plain string values\n"
-		"                              integer           - 64-bit decimal integers\n"
-		"                              digest            - base64-encoded 20-byte digests\n"
+		"Filter Options (optional; combinable with split):\n"
+		"  -n, --namespace NS           Keep only records in namespace NS\n"
+		"  -s, --set SETS               Keep only records in set(s), comma-separated\n"
+		"  -K, --key-file FILE          Keep only records whose user key appears in FILE\n"
+		"      --key-type TYPE          Type of keys in --key-file:\n"
+		"                                 string  (default) - plain string values\n"
+		"                                 integer           - 64-bit decimal integers\n"
+		"                                 digest            - base64-encoded 20-byte digests\n"
+		"\n"
+		"Split Options (require -O DIRECTORY; at least one or a filter required):\n"
+		"      --split-records N        Start a new output file every N records\n"
+		"      --split-size   N         Start a new output file after ~N MB of output\n"
+		"                               (Both can be combined; whichever threshold is\n"
+		"                                hit first triggers the split.)\n"
 		"\n"
 		"Other Options:\n"
-		"  -v, --verbose             Verbose output\n"
-		"      --version             Show version information\n"
-		"  -h, --help                Show this help message\n"
+		"  -v, --verbose                Verbose output\n"
+		"      --version                Show version information\n"
+		"  -h, --help                   Show this help message\n"
+		"\n"
+		"Split output file naming:  <input_basename>_<NNNN>.asb\n"
+		"  The first file carries '# first-file' and all secondary index / UDF\n"
+		"  definitions; subsequent files contain only records. All files are valid\n"
+		"  asrestore inputs individually or as a directory.\n"
 		"\n"
 		"Key File Format:\n"
 		"  One key per line. Lines starting with '#' and blank lines are ignored.\n"
-		"  For 'string' type: raw string values (one per line)\n"
-		"  For 'integer' type: decimal 64-bit signed integer values\n"
-		"  For 'digest' type: base64-encoded 20-byte record digests\n"
 		"\n"
 		"Examples:\n"
 		"  # Filter single file by namespace\n"
 		"  %s -i backup.asb -o filtered.asb -n mynamespace\n"
 		"\n"
-		"  # Filter directory by set\n"
-		"  %s -d /backup -O /filtered -s myset\n"
+		"  # Split a large file into 500 000-record chunks (enables parallel restore)\n"
+		"  %s -i big.asb -O parts/ --split-records 500000\n"
 		"\n"
-		"  # Filter by namespace and multiple sets\n"
-		"  %s -i backup.asb -o filtered.asb -n mynamespace -s set1,set2\n"
+		"  # Split into ~250 MB chunks\n"
+		"  %s -i big.asb -O parts/ --split-size 250\n"
+		"\n"
+		"  # Filter by namespace AND split\n"
+		"  %s -i big.asb -O parts/ -n myns --split-records 100000\n"
+		"\n"
+		"  # Split a directory of backup files\n"
+		"  %s -d /backup -O /parts --split-records 500000\n"
 		"\n"
 		"  # Filter by key list (string keys)\n"
 		"  %s -i backup.asb -o filtered.asb -K keys.txt\n"
-		"\n"
-		"  # Filter by digest list\n"
-		"  %s -i backup.asb -o filtered.asb -K digests.txt --key-type digest\n"
 		"\n",
-		prog, prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog, prog, prog);
 }
 
 /*
@@ -1007,6 +1086,458 @@ process_directory(const char *in_dir, const char *out_dir,
 
 		cf_free(in_path);
 		cf_free(out_path);
+	}
+
+	for (uint32_t i = 0; i < file_list.size; i++) {
+		cf_free(*(char **)as_vector_get(&file_list, i));
+	}
+
+	as_vector_destroy(&file_list);
+	return all_ok;
+}
+
+/*
+ * Opens and initializes one output file for split mode.
+ *
+ *  out_dir    – directory that will hold all split files
+ *  base_name  – filename stem (e.g. "backup"); the path becomes
+ *               "<out_dir>/<base_name>_<NNNN>.asb"
+ *  file_index – 1-based index (used to build the filename)
+ *  ns         – namespace string written to the header
+ *  first_file – when true, writes "# first-file" plus all buffered
+ *               secondary index and UDF definitions
+ *  g_indexes  – as_vector of index_param (by value); written if first_file
+ *  g_udfs     – as_vector of udf_param   (by value); written if first_file
+ *
+ * Returns true and leaves *fd open on success.
+ */
+static bool
+open_split_output(io_write_proxy_t *fd,
+		const char *out_dir, const char *base_name,
+		uint64_t file_index, const char *ns,
+		bool first_file,
+		const as_vector *g_indexes, const as_vector *g_udfs)
+{
+	char path[4096];
+	snprintf(path, sizeof path, "%s/%s_%04" PRIu64 ".asb",
+			out_dir, base_name, file_index);
+
+	if (io_write_proxy_init(fd, path, UINT64_MAX) != 0) {
+		err("Failed to create output file %s", path);
+		return false;
+	}
+
+	if (io_proxy_printf(fd, "Version " VERSION_3_1 "\n") < 0 ||
+			io_proxy_printf(fd, META_PREFIX META_NAMESPACE " %s\n",
+					escape(ns)) < 0) {
+		err("Error writing header to %s", path);
+		io_proxy_close(fd);
+		return false;
+	}
+
+	if (first_file) {
+		if (io_proxy_printf(fd, META_PREFIX META_FIRST_FILE "\n") < 0) {
+			err("Error writing first-file marker to %s", path);
+			io_proxy_close(fd);
+			return false;
+		}
+
+		for (uint32_t i = 0; i < g_indexes->size; i++) {
+			const index_param *idx =
+				(const index_param *)as_vector_get((as_vector *)g_indexes, i);
+
+			if (!text_put_secondary_index(fd, idx)) {
+				err("Error writing secondary index to %s", path);
+				io_proxy_close(fd);
+				return false;
+			}
+		}
+
+		for (uint32_t i = 0; i < g_udfs->size; i++) {
+			const udf_param *u =
+				(const udf_param *)as_vector_get((as_vector *)g_udfs, i);
+
+			if (!write_udf_param(fd, u)) {
+				err("Error writing UDF to %s", path);
+				io_proxy_close(fd);
+				return false;
+			}
+		}
+	}
+
+	ver("Opened split output file %s", path);
+	return true;
+}
+
+/*
+ * Splits (and optionally filters) a single backup file into multiple smaller
+ * output files stored in out_dir.
+ *
+ * Split triggers (whichever hits first):
+ *   split_records > 0  – roll over after this many records per file
+ *   split_size_bytes > 0 – roll over when the file exceeds this many bytes
+ *
+ * Filter parameters (ns_filter, set_list, keys) are applied the same way as
+ * in process_file(); pass NULL / empty vector / NULL to disable.
+ *
+ * Output file naming:  <out_dir>/<in_basename>_<NNNN>.asb
+ * The first output file carries "# first-file" and all global data (secondary
+ * indexes, UDF files) found in the input.  Subsequent files have only the
+ * version header and namespace metadata.
+ */
+static bool
+split_file(const char *in_path, const char *out_dir,
+		uint64_t split_records, uint64_t split_size_bytes,
+		const char *ns_filter, const as_vector *set_list,
+		const filter_keys_t *keys, uint64_t *out_total, uint64_t *out_written)
+{
+	bool res = false;
+	io_read_proxy_t  in_fd;
+	io_write_proxy_t out_fd;
+	bool in_opened  = false;
+	bool out_opened = false;
+
+	// Global data buffered from the input's header section.
+	// Stored by value (shallow copy); callers must not free_index/free_udf
+	// the originals after appending here.
+	as_vector g_indexes;   // as_vector of index_param
+	as_vector g_udfs;      // as_vector of udf_param
+	as_vector_init(&g_indexes, sizeof(index_param), 8);
+	as_vector_init(&g_udfs,    sizeof(udf_param),   8);
+
+	// ---- open input ----
+	if (io_read_proxy_init(&in_fd, in_path) != 0) {
+		err("Failed to open input file: %s", in_path);
+		goto cleanup;
+	}
+
+	in_opened = true;
+
+	// ---- read version header ----
+	char version[13];
+	memset(version, 0, sizeof version);
+
+	if (io_proxy_gets(&in_fd, version, (int)sizeof version) == NULL) {
+		err("Error reading version header from %s", in_path);
+		goto cleanup;
+	}
+
+	if (strncmp("Version ", version, 8) != 0 || version[11] != '\n') {
+		err("Invalid version line in %s", in_path);
+		goto cleanup;
+	}
+
+	bool legacy = strncmp(version + 8, VERSION_3_0, 3) == 0;
+
+	if (!legacy && strncmp(version + 8, VERSION_3_1, 3) != 0) {
+		err("Unsupported backup file version %.3s in %s", version + 8, in_path);
+		goto cleanup;
+	}
+
+	// ---- read metadata section ----
+	char file_namespace[256] = { 0 };
+	bool input_is_first = false;
+	uint32_t line_no = 2;
+
+	{
+		char meta[MAX_META_LINE + 4];
+		int32_t ch;
+
+		while ((ch = io_proxy_peekc_unlocked(&in_fd)) == (int32_t)META_PREFIX[0]) {
+			io_proxy_getc_unlocked(&in_fd);
+
+			if (io_proxy_gets(&in_fd, meta, (int)sizeof meta) == NULL) {
+				err("Error reading metadata from %s:%u", in_path, line_no);
+				goto cleanup;
+			}
+
+			for (uint32_t i = 0; i < sizeof meta; i++) {
+				if (meta[i] == '\n') { meta[i] = '\0'; break; }
+			}
+
+			if (meta[0] != META_PREFIX[1]) {
+				err("Invalid metadata line in %s:%u", in_path, line_no);
+				goto cleanup;
+			}
+
+			if (strcmp(meta + 1, META_FIRST_FILE) == 0) {
+				input_is_first = true;
+			} else if (strncmp(meta + 1, META_NAMESPACE,
+						sizeof META_NAMESPACE - 1) == 0 &&
+					meta[1 + sizeof META_NAMESPACE - 1] == ' ') {
+				const char *ns = meta + 1 + sizeof META_NAMESPACE - 1 + 1;
+				strncpy(file_namespace, ns, sizeof file_namespace - 1);
+				file_namespace[sizeof file_namespace - 1] = '\0';
+			}
+
+			line_no++;
+		}
+	}
+
+	const char *out_ns = (file_namespace[0] != '\0') ? file_namespace
+			: (ns_filter != NULL) ? ns_filter : "unknown";
+
+	// ---- derive base name for output files ----
+	// From "/path/to/backup.asb" → "backup"
+	const char *slash = strrchr(in_path, '/');
+	const char *fname = (slash != NULL) ? slash + 1 : in_path;
+	char base_name[256];
+	strncpy(base_name, fname, sizeof base_name - 1);
+	base_name[sizeof base_name - 1] = '\0';
+	{
+		size_t blen = strlen(base_name);
+
+		if (blen > ASB_SUFFIX_LEN &&
+				strcmp(base_name + blen - ASB_SUFFIX_LEN, ASB_SUFFIX) == 0) {
+			base_name[blen - ASB_SUFFIX_LEN] = '\0';
+		}
+	}
+
+	if (!ensure_directory(out_dir)) {
+		goto cleanup;
+	}
+
+	// ---- process entities ----
+	as_vector empty_ns_vec;
+	as_vector empty_bin_vec;
+	as_vector_init(&empty_ns_vec, sizeof(void *), 1);
+	as_vector_init(&empty_bin_vec, sizeof(void *), 1);
+
+	uint64_t file_index       = 1;
+	uint64_t records_in_file  = 0;
+	uint64_t file_total       = 0;
+	uint64_t file_written     = 0;
+	bool     body_ok          = true;
+
+	while (true) {
+		as_record   rec;
+		bool        expired;
+		index_param index;
+		udf_param   udf;
+
+		decoder_status status = text_parse(&in_fd, legacy,
+				&empty_ns_vec, &empty_bin_vec,
+				&line_no, &rec, 0, &expired, &index, &udf);
+
+		if (status == DECODER_EOF) {
+			break;
+		}
+
+		if (status == DECODER_ERROR) {
+			err("Error parsing %s at line %u", in_path, line_no);
+			body_ok = false;
+			break;
+		}
+
+		if (status == DECODER_INDEX) {
+			// Buffer – do NOT call free_index; vector owns the struct now.
+			as_vector_append(&g_indexes, &index);
+			continue;
+		}
+
+		if (status == DECODER_UDF) {
+			// Buffer – do NOT call free_udf; vector owns the struct now.
+			as_vector_append(&g_udfs, &udf);
+			continue;
+		}
+
+		// DECODER_RECORD path.
+		file_total++;
+
+		// Open the first output file lazily (after all global data is buffered).
+		if (!out_opened) {
+			if (!open_split_output(&out_fd, out_dir, base_name, file_index,
+						out_ns, input_is_first, &g_indexes, &g_udfs)) {
+				body_ok = false;
+				as_record_destroy(&rec);
+				break;
+			}
+
+			out_opened = true;
+		}
+
+		// Roll over if we've hit a split threshold.
+		bool rollover = false;
+
+		if (records_in_file > 0) {
+			if (split_records > 0 && records_in_file >= split_records) {
+				rollover = true;
+			}
+
+			if (!rollover && split_size_bytes > 0 &&
+					(uint64_t)io_write_proxy_absolute_pos(&out_fd) >=
+					split_size_bytes) {
+				rollover = true;
+			}
+		}
+
+		if (rollover) {
+			if (io_proxy_flush(&out_fd) != 0) {
+				err("Error flushing split output file");
+			}
+
+			io_proxy_close(&out_fd);
+			out_opened = false;
+
+			file_index++;
+			records_in_file = 0;
+
+			// Non-first files carry no "# first-file" / global data.
+			if (!open_split_output(&out_fd, out_dir, base_name, file_index,
+						out_ns, false, &g_indexes, &g_udfs)) {
+				body_ok = false;
+				as_record_destroy(&rec);
+				break;
+			}
+
+			out_opened = true;
+		}
+
+		// Apply filter and write.
+		if (record_matches(&rec, ns_filter, set_list, keys)) {
+			file_written++;
+
+			if (!text_put_record(&out_fd, false, &rec)) {
+				err("Error writing record to split output %s part %" PRIu64,
+						base_name, file_index);
+				as_record_destroy(&rec);
+				body_ok = false;
+				break;
+			}
+
+			records_in_file++;
+		}
+
+		as_record_destroy(&rec);
+	}
+
+	as_vector_destroy(&empty_ns_vec);
+	as_vector_destroy(&empty_bin_vec);
+
+	if (!body_ok) {
+		goto cleanup;
+	}
+
+	// If the input had global data but no records, still create output file #1.
+	if (!out_opened && input_is_first) {
+		if (!open_split_output(&out_fd, out_dir, base_name, file_index,
+					out_ns, true, &g_indexes, &g_udfs)) {
+			goto cleanup;
+		}
+
+		out_opened = true;
+	}
+
+	*out_total   += file_total;
+	*out_written += file_written;
+
+	inf("%s: total=%" PRIu64 ", written=%" PRIu64 ", skipped=%" PRIu64
+			", split into %" PRIu64 " file(s)",
+			in_path, file_total, file_written,
+			file_total - file_written, file_index);
+
+	res = true;
+
+cleanup:
+	if (in_opened) {
+		io_proxy_close(&in_fd);
+	}
+
+	if (out_opened) {
+		if (io_proxy_flush(&out_fd) != 0) {
+			err("Error flushing final split output");
+			res = false;
+		}
+
+		io_proxy_close(&out_fd);
+	}
+
+	// Free buffered global data.
+	for (uint32_t i = 0; i < g_indexes.size; i++) {
+		free_index((index_param *)as_vector_get(&g_indexes, i));
+	}
+
+	as_vector_destroy(&g_indexes);
+
+	for (uint32_t i = 0; i < g_udfs.size; i++) {
+		free_udf((udf_param *)as_vector_get(&g_udfs, i));
+	}
+
+	as_vector_destroy(&g_udfs);
+
+	return res;
+}
+
+/*
+ * Splits all .asb files found in in_dir, writing output to out_dir.
+ * Each input file is split independently.
+ */
+static bool
+split_directory(const char *in_dir, const char *out_dir,
+		uint64_t split_records, uint64_t split_size_bytes,
+		const char *ns_filter, const as_vector *set_list,
+		const filter_keys_t *keys, uint64_t *out_total, uint64_t *out_written)
+{
+	DIR *dir = opendir(in_dir);
+
+	if (dir == NULL) {
+		err("Failed to open input directory %s: %s", in_dir, strerror(errno));
+		return false;
+	}
+
+	as_vector file_list;
+	as_vector_init(&file_list, sizeof(char *), 64);
+
+	struct dirent *ent;
+
+	while ((ent = readdir(dir)) != NULL) {
+		const char *name = ent->d_name;
+		size_t nlen = strlen(name);
+
+		if (nlen > ASB_SUFFIX_LEN &&
+				strcmp(name + nlen - ASB_SUFFIX_LEN, ASB_SUFFIX) == 0) {
+			char *copy = safe_strdup(name);
+			as_vector_append(&file_list, &copy);
+		}
+	}
+
+	closedir(dir);
+
+	if (file_list.size == 0) {
+		err("No .asb files found in directory %s", in_dir);
+		as_vector_destroy(&file_list);
+		return false;
+	}
+
+	qsort(file_list.list, file_list.size, sizeof(char *), compare_str_ptr);
+
+	if (!ensure_directory(out_dir)) {
+		for (uint32_t i = 0; i < file_list.size; i++) {
+			cf_free(*(char **)as_vector_get(&file_list, i));
+		}
+
+		as_vector_destroy(&file_list);
+		return false;
+	}
+
+	bool all_ok = true;
+
+	for (uint32_t i = 0; i < file_list.size; i++) {
+		const char *name = *(const char **)as_vector_get(&file_list, i);
+
+		size_t in_len = strlen(in_dir) + 1 + strlen(name) + 1;
+		char *in_path = (char *)safe_malloc(in_len);
+		snprintf(in_path, in_len, "%s/%s", in_dir, name);
+
+		inf("Splitting %s -> %s/", in_path, out_dir);
+
+		if (!split_file(in_path, out_dir, split_records, split_size_bytes,
+					ns_filter, set_list, keys, out_total, out_written)) {
+			err("Failed to split file: %s", in_path);
+			all_ok = false;
+		}
+
+		cf_free(in_path);
 	}
 
 	for (uint32_t i = 0; i < file_list.size; i++) {
